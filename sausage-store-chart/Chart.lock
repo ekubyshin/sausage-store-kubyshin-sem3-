@@ -1,0 +1,15 @@
+dependencies:
+- name: backend
+  repository: ""
+  version: 0.1.3
+- name: backend-report
+  repository: ""
+  version: 0.1.3
+- name: frontend
+  repository: ""
+  version: 0.1.3
+- name: infra
+  repository: ""
+  version: 0.1.3
+digest: sha256:c619c8e07baef711286830e404ed1b4d3ee3b6c342e1b9caa273dbae2f9771b9
+generated: "2026-09-25T16:40:09.696011+03:00"

@@ -1,0 +1,239 @@
+---
+- name: Require backend credentials for Vault
+  ansible.builtin.assert:
+    that:
+      - (lookup('env', 'POSTGRES_USER') | trim) | length > 0
+      - (lookup('env', 'POSTGRES_PASSWORD') | trim) | length > 0
+      - (lookup('env', 'MONGODB_REPORTS_USER') | trim) | length > 0
+      - (lookup('env', 'MONGODB_REPORTS_PASSWORD') | trim) | length > 0
+      - (lookup('env', 'MONGODB_REPORTS_DATABASE') | trim) | length > 0
+      - "'${' not in (lookup('env', 'POSTGRES_USER') | trim)"
+      - "'${' not in (lookup('env', 'POSTGRES_PASSWORD') | trim)"
+      - "'${' not in (lookup('env', 'MONGODB_REPORTS_USER') | trim)"
+      - "'${' not in (lookup('env', 'MONGODB_REPORTS_PASSWORD') | trim)"
+      - "'${' not in (lookup('env', 'MONGODB_REPORTS_DATABASE') | trim)"
+    fail_msg: >-
+      Set real values for POSTGRES_USER, POSTGRES_PASSWORD, MONGODB_REPORTS_USER,
+      MONGODB_REPORTS_PASSWORD and MONGODB_REPORTS_DATABASE.
+      A value like ${POSTGRES_USER} is not expanded and will be stored as-is.
+
+- name: Create Vault directories
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ item.owner }}"
+    group: "{{ item.group }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - path: "{{ vault_config_dir }}"
+      owner: root
+      group: root
+      mode: "0755"
+    - path: "{{ vault_data_dir }}"
+      owner: "100"
+      group: "1000"
+      mode: "0770"
+
+- name: Install the Vault server config
+  ansible.builtin.template:
+    src: vault.hcl.j2
+    dest: "{{ vault_config_dir }}/vault.hcl"
+    mode: "0644"
+
+- name: Pull the Vault image
+  ansible.builtin.command:
+    argv:
+      - docker
+      - pull
+      - "{{ vault_image }}"
+  register: vault_pull
+  changed_when: "'Downloaded newer image' in vault_pull.stdout or 'Pull complete' in vault_pull.stdout"
+  failed_when: false
+  retries: 5
+  delay: 10
+  until: vault_pull.rc == 0
+
+- name: Fail when the Vault image cannot be pulled
+  ansible.builtin.fail:
+    msg: "{{ vault_pull.stderr | default(vault_pull.stdout) }}"
+  when: vault_pull.rc != 0
+
+- name: Stop the Vault container if it already exists
+  ansible.builtin.command:
+    argv:
+      - docker
+      - stop
+      - "{{ vault_container_name }}"
+  register: vault_stop
+  changed_when: vault_stop.rc == 0
+  failed_when: false
+
+- name: Remove the Vault container if it already exists
+  ansible.builtin.command:
+    argv:
+      - docker
+      - rm
+      - "{{ vault_container_name }}"
+  register: vault_remove
+  changed_when: vault_remove.rc == 0
+  failed_when: false
+
+- name: Run Vault
+  ansible.builtin.command:
+    argv:
+      - docker
+      - run
+      - -d
+      - --name
+      - "{{ vault_container_name }}"
+      - --restart
+      - unless-stopped
+      - --cap-add
+      - IPC_LOCK
+      - -p
+      - "{{ vault_port }}:8200"
+      - -e
+      - VAULT_ADDR=http://127.0.0.1:8200
+      - -v
+      - "{{ vault_config_dir }}:/vault/config"
+      - -v
+      - "{{ vault_data_dir }}:/vault/file"
+      - "{{ vault_image }}"
+      - server
+
+- name: Wait until Vault answers
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - "{{ vault_container_name }}"
+      - vault
+      - status
+      - -format=json
+  register: vault_status
+  changed_when: false
+  # 0 — unsealed, 2 — sealed. Both still print JSON. Any other code means Vault is not ready.
+  failed_when: false
+  retries: 30
+  delay: 2
+  until: vault_status.rc in [0, 2] and (vault_status.stdout | default('') | trim | length) > 0
+
+- name: Read the Vault status
+  ansible.builtin.set_fact:
+    vault_status_json: "{{ vault_status.stdout | trim | from_json }}"
+
+- name: Check for saved Vault init data
+  ansible.builtin.stat:
+    path: "{{ vault_init_file }}"
+  register: vault_init_stat
+
+- name: Initialize Vault
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - "{{ vault_container_name }}"
+      - vault
+      - operator
+      - init
+      - -key-shares=1
+      - -key-threshold=1
+      - -format=json
+  register: vault_init
+  no_log: true
+  when: not vault_status_json.initialized
+
+- name: Save Vault init data on the virtual machine
+  ansible.builtin.copy:
+    content: "{{ vault_init.stdout | default('', true) }}"
+    dest: "{{ vault_init_file }}"
+    mode: "0600"
+  no_log: true
+  when: vault_init is changed
+
+- name: Require init data for an already initialized Vault
+  ansible.builtin.fail:
+    msg: "Vault is initialized, but {{ vault_init_file }} is missing, so it cannot be unsealed."
+  when:
+    - vault_status_json.initialized | bool
+    - not vault_init_stat.stat.exists
+
+- name: Read Vault init data
+  ansible.builtin.slurp:
+    src: "{{ vault_init_file }}"
+  register: vault_init_file_content
+  no_log: true
+
+- name: Load the Vault unseal key and root token
+  ansible.builtin.set_fact:
+    vault_unseal_key: "{{ (vault_init_file_content.content | b64decode | from_json).unseal_keys_b64[0] }}"
+    vault_root_token: "{{ (vault_init_file_content.content | b64decode | from_json).root_token }}"
+  no_log: true
+
+- name: Unseal Vault
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - "{{ vault_container_name }}"
+      - vault
+      - operator
+      - unseal
+      - "{{ vault_unseal_key }}"
+  no_log: true
+  when: vault_status_json.sealed | bool
+
+- name: List secret engines
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -e
+      - "VAULT_TOKEN={{ vault_root_token }}"
+      - "{{ vault_container_name }}"
+      - vault
+      - secrets
+      - list
+      - -format=json
+  register: vault_mounts
+  changed_when: false
+  no_log: true
+
+- name: Enable the KV v1 secrets engine
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -e
+      - "VAULT_TOKEN={{ vault_root_token }}"
+      - "{{ vault_container_name }}"
+      - vault
+      - secrets
+      - enable
+      - -path={{ vault_kv_mount }}
+      - -version=1
+      - kv
+  no_log: true
+  when: (vault_kv_mount ~ '/') not in (vault_mounts.stdout | from_json)
+
+- name: Store backend credentials in Vault
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -e
+      - "VAULT_TOKEN={{ vault_root_token }}"
+      - "{{ vault_container_name }}"
+      - vault
+      - kv
+      - put
+      - "{{ vault_kv_mount }}/{{ vault_secret_path }}"
+      - "spring.datasource.username={{ vault_secret_data['spring.datasource.username'] }}"
+      - "spring.datasource.password={{ vault_secret_data['spring.datasource.password'] }}"
+      - "spring.data.mongodb.uri={{ vault_secret_data['spring.data.mongodb.uri'] }}"
+  no_log: true
+  changed_when: true
+
+- name: Report the Vault address
+  ansible.builtin.debug:
+    msg: "VAULT_HOST={{ ansible_host }}"

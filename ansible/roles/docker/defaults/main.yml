@@ -1,0 +1,11 @@
+---
+docker_apt_arch: "{{ 'arm64' if ansible_architecture == 'aarch64' else 'amd64' }}"
+# download.docker.com с ВМ недоступен. Это зеркало того же репозитория.
+docker_apt_repo: https://mirror.yandex.ru/mirrors/download.docker.com/linux/ubuntu
+docker_packages:
+  - docker-ce
+  - docker-ce-cli
+  - containerd.io
+docker_registry_mirrors:
+  - https://dockerhub.timeweb.cloud
+  - https://cr.yandex/mirror

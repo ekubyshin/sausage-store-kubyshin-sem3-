@@ -1,0 +1,19 @@
+---
+- name: Install Docker and run Vault
+  hosts: all
+  become: true
+  gather_facts: false
+  pre_tasks:
+    - name: Require the virtual machine address
+      ansible.builtin.assert:
+        that:
+          - (ansible_host | default('') | length) > 0
+        fail_msg: >-
+          Set the public IP of {{ inventory_hostname }}
+          (VM_PROD_ADDRESS for vm-prod, VM_DEV_ADDRESS for vm-dev).
+
+    - name: Gather facts
+      ansible.builtin.setup:
+  roles:
+    - docker
+    - vault

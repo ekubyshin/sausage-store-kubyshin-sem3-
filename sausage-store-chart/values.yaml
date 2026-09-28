@@ -1,0 +1,155 @@
+global:
+  imagePullPolicy: Always
+  vault:
+    host: ${VAULT_HOST}
+    port: 8200
+    scheme: http
+    name: vault-token
+    vaultToken: ${VAULT_TOKEN}
+    kvMount: kv
+    secretPath: sausage-store
+    kvVersion: "1"
+    image: cr.yandex/mirror/hashicorp/vault:1.14.1
+  mongodb:
+    reports:
+      database: ${MONGODB_REPORTS_DATABASE}
+      user: ${MONGODB_REPORTS_USER}
+      password: ${MONGODB_REPORTS_PASSWORD}
+    containerPort: 27017
+
+
+frontend:
+  replicas: 1
+  revisionHistoryLimit: 15
+  strategy:
+    type: Recreate
+  service:
+    port: 80
+  global:
+    imagePullPolicy: Always
+  ingress:
+    host: front-kubyshin.2sem.students-projects.ru
+    path: /
+    pathType: Prefix
+  containerPort: 80
+  image: ${DOCKER_USER}/sausage-frontend:latest
+  resources:
+    requests:
+      memory: "32Mi"
+      cpu: "25m"
+    limits:
+      memory: "128Mi"
+      cpu: "50m"
+  nginxConf: nginx.conf
+
+backend:
+  annotations:
+    path: /actuator/prometheus
+    port: "8080"
+    scrape: "true"
+  env:
+    postgresUri: jdbc:postgresql://postgresql:5432/${POSTGRES_DB}
+    reportPath: /logs/reports
+    logPath: /logs
+  service:
+    port: 8080
+  revisionHistoryLimit: 15
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+       maxSurge: 25%
+       maxUnavailable: 25%
+  image: ${DOCKER_USER}/sausage-backend:latest
+  imagePullPolicy: Always
+  resources:
+    requests:
+      memory: "128Mi"
+      cpu: "200m"
+    limits:
+      memory: "256Mi"
+      cpu: "200m"
+  containerPort: 8080
+  startupProbe:
+    httpGet:
+      path: /actuator/health
+      port: 8080
+    periodSeconds: 10
+    failureThreshold: 30
+  livenessProbe:
+    httpGet:
+      path: /actuator/health
+      port: 8080
+    periodSeconds: 10
+    failureThreshold: 3
+  vpa:
+    updatePolicy:
+      updateMode: "Off"
+    resourcePolicy:
+      containerPolicies:
+        - containerName: "*"
+          mode: "Auto"
+          controlledResources: ["cpu", "memory"]
+          minAllowed:
+            cpu: 0m
+            memory: 0Mi
+          maxAllowed:
+            cpu: 200m
+            memory: 256Mi
+
+backend-report:
+  replicas: 1
+  revisionHistoryLimit: 15
+  strategy:
+    type: Recreate
+  image: ${DOCKER_USER}/sausage-backend-report:latest
+  containerPort: 8080
+  service:
+    port: 8080
+  resources:
+    requests:
+      memory: "64Mi"
+      cpu: "50m"
+    limits:
+      memory: "256Mi"
+      cpu: "300m"
+  hpa:
+    enabled: true
+    minReplicas: 1
+    maxReplicas: 3
+    targetCPUUtilizationPercentage: 70
+
+infra:
+  postgresql:
+    image: postgres:13
+    containerPort: 5432
+    storage: 2Gi
+    env:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "128Mi"
+      limits:
+        cpu: "500m"
+        memory: "512Mi"
+  mongodb:
+    image: mongo:7.0
+    env:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_INITDB_ROOT_USERNAME}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_INITDB_ROOT_PASSWORD}
+    reports:
+      database: ${MONGODB_REPORTS_DATABASE}
+      user: ${MONGODB_REPORTS_USER}
+      password: ${MONGODB_REPORTS_PASSWORD}
+    containerPort: 27017
+    storage: 1Gi
+    resources:
+      requests:
+        cpu: "200m"
+        memory: "256Mi"
+      limits:
+        cpu: "200m"
+        memory: "256Mi"

@@ -1,0 +1,298 @@
+variables:
+  TF_ROOT: ${CI_PROJECT_DIR}/infra
+  TF_HTTP_PASSWORD: ${MY_GITLAB_TOKEN}
+  CHART_VERSION: "0.1.3"
+  OPERATION:
+    description: "Select CI/CD-operation"
+    value: "terraform"
+    options:
+      - "terraform"
+      - "ansible"
+      - "k8s"
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "web"
+    - when: never
+
+stages:
+  - format
+  - validate
+  - lint
+  - checkov_scan
+  - plan
+  - apply
+  - terratest
+  - destroy
+  - ansible
+  - build
+  - package
+
+cache:
+  key: "$CI_JOB_NAME"
+  paths:
+    - .terraform
+    - ~/.terraform.d/plugin-cache
+    - vendor/
+    - go.sum
+    - go.mod
+
+before_script:
+  - cd ${TF_ROOT}
+  - echo ${AUTHORIZED_KEY} | base64 -d > ./authorized_key.json
+
+plan:
+  stage: plan
+  image: hashicorp/terraform:1.6.6
+  script:
+    - |
+      test -n "${SSH_PUBLIC_KEY:-}"
+      export TF_VAR_ssh_public_key="$(printf '%s' "${SSH_PUBLIC_KEY}" | tr -d '[:space:]' | base64 -d)"
+    - terraform init
+    - terraform plan
+  rules:
+    - if: $OPERATION == "terraform"
+      when: on_success
+
+security_scan:
+  stage: checkov_scan
+  image:
+    name: bridgecrew/checkov:latest
+    entrypoint: [""]
+  before_script: []
+  script:
+    - checkov --directory infra --config-file infra/.checkov.yml
+  needs:
+    - format
+    - validate
+    - lint
+  allow_failure: true
+  rules:
+    - if: $OPERATION == "terraform"
+      when: on_success
+
+apply:
+  stage: apply
+  image: hashicorp/terraform:1.6.6
+  needs:
+    - plan
+  script:
+    - |
+      test -n "${SSH_PUBLIC_KEY:-}"
+      export TF_VAR_ssh_public_key="$(printf '%s' "${SSH_PUBLIC_KEY}" | tr -d '[:space:]' | base64 -d)"
+    - terraform init -input=false
+    - terraform apply -input=false -auto-approve
+  rules:
+    - if: $OPERATION == "terraform"
+      when: on_success
+
+terratest:
+  stage: terratest
+  image:
+    name: hashicorp/terraform:1.6.6
+    entrypoint: [""]
+  variables:
+    CGO_ENABLED: "0"
+  before_script:
+    - |
+      if command -v apk >/dev/null 2>&1; then
+        apk add --no-cache go git
+      elif ! command -v go >/dev/null 2>&1; then
+        curl -fsSL "https://go.dev/dl/go1.21.13.linux-amd64.tar.gz" -o /tmp/go.tgz
+        mkdir -p "${CI_PROJECT_DIR}/.goroot"
+        tar -C "${CI_PROJECT_DIR}/.goroot" --strip-components=1 -xzf /tmp/go.tgz
+        export PATH="${CI_PROJECT_DIR}/.goroot/bin:${PATH}"
+      fi
+      go version
+      terraform version
+    - |
+      test -n "${SSH_PUBLIC_KEY:-}"
+      export TF_VAR_ssh_public_key="$(printf '%s' "${SSH_PUBLIC_KEY}" | tr -d '[:space:]' | base64 -d)"
+    - echo "${AUTHORIZED_KEY}" | base64 -d > "${CI_PROJECT_DIR}/infra/authorized_key.json"
+    - cd "${CI_PROJECT_DIR}/infra/test"
+  script:
+    - go test -v -count=1 -timeout 45m ./...
+  needs:
+    - apply
+  allow_failure: false
+  rules:
+    - if: $OPERATION == "terraform"
+      when: on_success
+
+lint:
+  stage: lint
+  image: hashicorp/terraform:1.6.6
+  needs:
+    - validate
+  rules:
+    - if: $OPERATION == "ansible" || $OPERATION == "k8s"
+      when: never
+    - when: on_success
+  script:
+    - terraform fmt -check -recursive
+    - terraform init -backend=false -input=false
+    - |
+      curl -fsSL -o /tmp/tflint.zip https://github.com/terraform-linters/tflint/releases/download/v0.54.0/tflint_linux_amd64.zip
+      mkdir -p /tmp/tflint "$HOME/bin"
+      if command -v unzip >/dev/null 2>&1; then
+        unzip -o /tmp/tflint.zip -d /tmp/tflint
+      elif command -v python3 >/dev/null 2>&1; then
+        python3 -c "import zipfile; zipfile.ZipFile('/tmp/tflint.zip').extractall('/tmp/tflint')"
+      else
+        busybox unzip -o /tmp/tflint.zip -d /tmp/tflint
+      fi
+      mv /tmp/tflint/tflint "$HOME/bin/tflint"
+      chmod +x "$HOME/bin/tflint"
+      export PATH="$HOME/bin:$PATH"
+      tflint --init
+      tflint
+
+format:
+  stage: format                                        # Название стадии пайплайна
+  image: hashicorp/terraform:1.6.6                     # Используем официальный образ Terraform
+  rules:
+    - if: $OPERATION == "ansible" || $OPERATION == "k8s"
+      when: never
+    - when: on_success
+  script:
+    - terraform fmt -check -recursive                  # Проверка форматирования всех .tf-файлов в каталоге и подкаталогах
+
+validate:
+  stage: validate                                 # Название стадии в пайплайне GitLab
+  image: hashicorp/terraform:1.6.6                # Используем официальный образ Terraform
+  needs:
+    - format
+  rules:
+    - if: $OPERATION == "ansible" || $OPERATION == "k8s"
+      when: never
+    - when: on_success
+  script:
+    - terraform init -backend=false -input=false
+    - terraform validate                          # Проверка структуры, типов, ссылок и логики Terraform-конфигурации
+
+
+# Установка Docker и Vault через ansible-playbook
+ansible-deploy:
+  stage: ansible
+  image:
+    name: hashicorp/terraform:1.6.6
+    entrypoint: [""]
+  rules:
+    - if: $OPERATION == "ansible"
+      when: on_success
+  before_script:
+    - |
+      curl -fsSL -o /tmp/python.tgz "https://github.com/astral-sh/python-build-standalone/releases/download/20250918/cpython-3.12.11+20250918-x86_64-unknown-linux-gnu-install_only.tar.gz"
+      mkdir -p "$HOME/python"
+      tar -C "$HOME/python" --strip-components=1 -xzf /tmp/python.tgz
+      export PATH="$HOME/python/bin:$PATH"
+      python3 -m pip install --no-cache-dir 'ansible-core==2.16.14'
+    - |
+      test -n "${SSH_PRIVATE_KEY:-}"
+      test -n "${SSH_PUBLIC_KEY:-}"
+      mkdir -p ~/.ssh && chmod 700 ~/.ssh
+      rm -f ~/.ssh/id_ed25519 ~/.ssh/id_ed25519.pub
+      printf '%s' "${SSH_PRIVATE_KEY}" | tr -d '[:space:]' | base64 -d > ~/.ssh/id_ed25519
+      printf '%s' "${SSH_PUBLIC_KEY}" | tr -d '[:space:]' | base64 -d > ~/.ssh/id_ed25519.pub
+      chmod 600 ~/.ssh/id_ed25519
+      chmod 644 ~/.ssh/id_ed25519.pub
+      export TF_VAR_ssh_public_key="$(cat ~/.ssh/id_ed25519.pub)"
+    - echo "${AUTHORIZED_KEY}" | base64 -d > "${CI_PROJECT_DIR}/infra/authorized_key.json"
+  script:
+    - |
+      cd "${CI_PROJECT_DIR}/infra"
+      terraform init -input=false
+      export VM_PROD_ADDRESS="$(terraform output -raw vm_prod_address)"
+      export VM_DEV_ADDRESS="$(terraform output -raw vm_dev_address)"
+      test -n "${VM_PROD_ADDRESS}"
+      test -n "${VM_DEV_ADDRESS}"
+      python3 - <<'PY'
+      import os, sys
+      names = [
+          "POSTGRES_USER",
+          "POSTGRES_PASSWORD",
+          "MONGODB_REPORTS_USER",
+          "MONGODB_REPORTS_PASSWORD",
+          "MONGODB_REPORTS_DATABASE",
+      ]
+      failed = False
+      for name in names:
+          value = os.environ.get(name, "").strip()
+          if not value or "${" in value:
+              print(f"{name} is empty or still a placeholder", file=sys.stderr)
+              failed = True
+          else:
+              print(f"{name}: set, length {len(value)}")
+      if failed:
+          sys.exit(1)
+      PY
+      cd "${CI_PROJECT_DIR}/ansible"
+      ansible-playbook vault-playbook.yml
+
+
+destroy:
+  stage: destroy
+  image: hashicorp/terraform:1.6.6
+  needs:
+    - terratest
+  script:
+    - |
+      test -n "${SSH_PUBLIC_KEY:-}"
+      export TF_VAR_ssh_public_key="$(printf '%s' "${SSH_PUBLIC_KEY}" | tr -d '[:space:]' | base64 -d)"
+    - terraform init -input=false
+    - terraform destroy -input=false -auto-approve
+  rules:
+    - if: $OPERATION == "terraform"
+      when: manual
+  allow_failure: true
+
+
+# Сборка и пуш Docker-образов в DockerHub.
+# Kaniko не поднимает docker:dind, поэтому раннеру не нужен privileged.
+build-and-push-images:
+  stage: build
+  image:
+    name: gcr.io/kaniko-project/executor:v1.23.2-debug
+    entrypoint: [""]
+  before_script:
+    - mkdir -p /kaniko/.docker
+    - |
+      AUTH=$(printf '%s:%s' "$DOCKER_USER" "$DOCKER_PASSWORD" | base64 | tr -d '\n')
+      printf '{"auths":{"https://index.docker.io/v1/":{"auth":"%s"}}}\n' "$AUTH" > /kaniko/.docker/config.json
+  script:
+    - /kaniko/executor --context "${CI_PROJECT_DIR}/backend" --dockerfile "${CI_PROJECT_DIR}/backend/Dockerfile" --build-arg "VERSION=${CI_COMMIT_SHA}" --destination "${DOCKER_USER}/sausage-backend:latest"
+    - /kaniko/executor --context "${CI_PROJECT_DIR}/frontend" --dockerfile "${CI_PROJECT_DIR}/frontend/Dockerfile" --destination "${DOCKER_USER}/sausage-frontend:latest"
+    - /kaniko/executor --context "${CI_PROJECT_DIR}/backend-report" --dockerfile "${CI_PROJECT_DIR}/backend-report/Dockerfile" --destination "${DOCKER_USER}/sausage-backend-report:latest"
+  rules:
+    - if: $OPERATION == "k8s"
+      when: on_success
+  tags:
+    - docker
+
+# Сборка зависимостей, упаковка и пуш Helm-чарта в Nexus
+package-helm-chart:
+  stage: package
+  image:
+    name: alpine/helm:3.12.0
+    entrypoint: [""]
+  # Отключаем глобальный before_script (cd в infra и расшифровка ключа не нужны)
+  before_script: []
+  script:
+    - apk add --no-cache curl
+    - helm dependency build ./sausage-store-chart/
+    - helm package ./sausage-store-chart/ --version "${CHART_VERSION}"
+    - |
+      case "${NEXUS_HELM_REPO}" in
+        */) upload_url="${NEXUS_HELM_REPO}" ;;
+        *) upload_url="${NEXUS_HELM_REPO}/" ;;
+      esac
+      curl -fS -u "${NEXUS_HELM_REPO_USER}:${NEXUS_HELM_REPO_PASSWORD}" \
+        --upload-file "sausage-store-${CHART_VERSION}.tgz" \
+        "${upload_url}"
+  needs:
+    - build-and-push-images
+  rules:
+    - if: $OPERATION == "k8s"
+      when: on_success
+  tags:
+    - docker

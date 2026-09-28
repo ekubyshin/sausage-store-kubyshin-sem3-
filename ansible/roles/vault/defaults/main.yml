@@ -1,0 +1,14 @@
+---
+vault_container_name: vault
+# В cr.yandex/mirror/hashicorp/vault нет тега 1.15.6, последний есть 1.14.1.
+vault_image: cr.yandex/mirror/hashicorp/vault:1.14.1
+vault_port: 8200
+vault_config_dir: /opt/vault/config
+vault_data_dir: /opt/vault/file
+vault_init_file: /opt/vault/init.json
+vault_kv_mount: kv
+vault_secret_path: sausage-store
+vault_secret_data:
+  spring.datasource.username: "{{ lookup('env', 'POSTGRES_USER') | trim }}"
+  spring.datasource.password: "{{ lookup('env', 'POSTGRES_PASSWORD') | trim }}"
+  spring.data.mongodb.uri: "mongodb://{{ lookup('env', 'MONGODB_REPORTS_USER') | trim | urlencode }}:{{ lookup('env', 'MONGODB_REPORTS_PASSWORD') | trim | urlencode }}@mongodb:27017/{{ lookup('env', 'MONGODB_REPORTS_DATABASE') | trim }}"

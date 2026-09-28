@@ -1,0 +1,9 @@
+---
+all:
+  hosts:
+    vm-prod:
+      ansible_host: "{{ vm_prod_host | default(lookup('env', 'VM_PROD_ADDRESS'), true) }}"
+      ansible_user: ubuntu
+    vm-dev:
+      ansible_host: "{{ vm_dev_host | default(lookup('env', 'VM_DEV_ADDRESS'), true) }}"
+      ansible_user: ubuntu

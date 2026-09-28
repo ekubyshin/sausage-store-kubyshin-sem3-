@@ -1,0 +1,4 @@
+.env
+.github
+authorized_key.json
+infra/.terraform*
